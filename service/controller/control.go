@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -23,17 +25,41 @@ func (c *Controller) removeInbound(tag string) error {
 	return err
 }
 
-// statsOutboundWrapper wraps outbound.Handler to ensure user downlink traffic is counted.
+// statsOutboundWrapper wraps outbound.Handler to ensure user downlink traffic is counted
+// and user online IP is tracked for alive_ip reporting.
 type statsOutboundWrapper struct {
 	outbound.Handler
-	pm policy.Manager
-	sm stats.Manager
+	pm      policy.Manager
+	sm      stats.Manager
+	limiter *limiter.Limiter
 }
 
 func (w *statsOutboundWrapper) Dispatch(ctx context.Context, link *transport.Link) {
-	// Disable kernel splice to avoid Vision/REALITY bypassing userland stats path
-	if sess := session.InboundFromContext(ctx); sess != nil {
-		sess.CanSpliceCopy = 3
+	sessionInbound := session.InboundFromContext(ctx)
+	if sessionInbound != nil {
+		// Disable kernel splice to avoid Vision/REALITY bypassing userland stats path
+		sessionInbound.CanSpliceCopy = 3
+
+		// Track user IP for alive_ip reporting, device limiting, and speed limiting.
+		// This is the interception point where ALL protocols (VLESS, VMess, Trojan, etc.)
+		// pass through, because the controller wraps every outbound handler with this wrapper.
+		// The official xray-core dispatcher calls this via routedDispatch -> handler.Dispatch.
+		if w.limiter != nil && sessionInbound.User != nil && len(sessionInbound.User.Email) > 0 {
+			bucket, ok, reject := w.limiter.GetUserBucket(
+				sessionInbound.Tag,
+				sessionInbound.User.Email,
+				sessionInbound.Source.Address.IP().String(),
+			)
+			if reject {
+				errors.LogWarning(ctx, "Devices reach the limit: ", sessionInbound.User.Email)
+				common.Close(link.Writer)
+				common.Interrupt(link.Reader)
+				return
+			}
+			if ok {
+				link.Writer = w.limiter.RateWriter(link.Writer, bucket)
+			}
+		}
 	}
 	w.Handler.Dispatch(ctx, link)
 }
@@ -68,7 +94,8 @@ func (c *Controller) addOutbound(config *core.OutboundHandlerConfig) error {
 		return fmt.Errorf("not an InboundHandler: %s", err)
 	}
 	// Wrap outbound handler to ensure downlink stats are always counted (e.g., REALITY/VLESS cases)
-	handler = &statsOutboundWrapper{Handler: handler, pm: c.pm, sm: c.stm}
+	// and user online IP is tracked for alive_ip reporting.
+	handler = &statsOutboundWrapper{Handler: handler, pm: c.pm, sm: c.stm, limiter: c.dispatcher.Limiter}
 	if err := c.obm.AddHandler(context.Background(), handler); err != nil {
 		return err
 	}
