@@ -1,0 +1,15 @@
+[Unit]
+Description=XrayR Service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/nginx-acme/services/xrayr
+ExecStart=/root/nginx-acme/services/xrayr/XrayR --config /root/nginx-acme/services/xrayr/config.yml
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
