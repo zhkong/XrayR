@@ -25,8 +25,8 @@ func (c *Controller) removeInbound(tag string) error {
 	return err
 }
 
-// statsOutboundWrapper wraps outbound.Handler to ensure user downlink traffic is counted
-// and user online IP is tracked for alive_ip reporting.
+// statsOutboundWrapper wraps outbound.Handler to ensure user traffic is tracked
+// and per-user rate limiting applies in both directions.
 type statsOutboundWrapper struct {
 	outbound.Handler
 	pm      policy.Manager
@@ -44,11 +44,12 @@ func (w *statsOutboundWrapper) Dispatch(ctx context.Context, link *transport.Lin
 		// This is the interception point where ALL protocols (VLESS, VMess, Trojan, etc.)
 		// pass through, because the controller wraps every outbound handler with this wrapper.
 		// The official xray-core dispatcher calls this via routedDispatch -> handler.Dispatch.
+		sourceIP := sessionInbound.Source.Address.IP().String()
 		if w.limiter != nil && sessionInbound.User != nil && len(sessionInbound.User.Email) > 0 {
 			bucket, ok, reject := w.limiter.GetUserBucket(
 				sessionInbound.Tag,
 				sessionInbound.User.Email,
-				sessionInbound.Source.Address.IP().String(),
+				sourceIP,
 			)
 			if reject {
 				errors.LogWarning(ctx, "Devices reach the limit: ", sessionInbound.User.Email)
@@ -57,6 +58,7 @@ func (w *statsOutboundWrapper) Dispatch(ctx context.Context, link *transport.Lin
 				return
 			}
 			if ok {
+				link.Reader = w.limiter.RateReader(link.Reader, bucket)
 				link.Writer = w.limiter.RateWriter(link.Writer, bucket)
 			}
 		}
